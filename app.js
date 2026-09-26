@@ -3,10 +3,6 @@ const CHAR_NOTIFY = "fff1";
 const CHAR_WRITE = "fff2";
 const DEVICE_NAME_PREFIX = "CityU";
 const AUTO_CONNECT_RETRY_MS = 3000;
-// BLE 握手的超时上限。Web Bluetooth 的 connect() 在设备在范围内但无响应时可能永不 settle，
-// 没有这个上限，connectToDevice 的 finally 不会执行，页面会永久卡在「正在连接」，
-// 且 connectionAttemptInProgress 再也清不掉，手动和自动重连全部失效。
-const CONNECT_TIMEOUT_MS = 15000;
 const BATTERY_EMPTY_VOLTAGE = 2.5;
 const BATTERY_VOLTAGE_RANGE = 1.2;
 const TELEMETRY_SYNC_0 = 0xA5;
@@ -240,34 +236,6 @@ async function autoSearchCityUDevices() {
   }
 }
 
-// 给 BLE 握手加上时间上限。超时之后 promise 仍可能迟到地成功，那时必须清理掉，
-// 否则会留下一条悬空的 GATT 连接，让后续重试继续卡住。
-function withConnectTimeout(promise, label, onLateResolve) {
-  return new Promise((resolve, reject) => {
-    let timedOut = false;
-    const timerId = window.setTimeout(() => {
-      timedOut = true;
-      reject(new Error(`${label}超时（${CONNECT_TIMEOUT_MS} ms）`));
-    }, CONNECT_TIMEOUT_MS);
-
-    promise.then(
-      value => {
-        if (timedOut) {
-          if (onLateResolve) onLateResolve(value);
-          return;
-        }
-        clearTimeout(timerId);
-        resolve(value);
-      },
-      err => {
-        if (timedOut) return;
-        clearTimeout(timerId);
-        reject(err);
-      }
-    );
-  });
-}
-
 async function connectToDevice(device) {
   if (!isCityUDevice(device)) throw new Error(`设备名称必须以 ${DEVICE_NAME_PREFIX} 开头`);
   if (connectionAttemptInProgress) throw new Error("已有蓝牙连接正在进行");
@@ -282,11 +250,9 @@ async function connectToDevice(device) {
     bleDevice = device;
     bleDevice.removeEventListener("gattserverdisconnected", onDisconnected);
     bleDevice.addEventListener("gattserverdisconnected", onDisconnected);
-    gattServer = await withConnectTimeout(bleDevice.gatt.connect(), "连接设备", server => {
-      try { if (server) server.disconnect(); } catch (err) { /* 尽力而为 */ }
-    });
+    gattServer = await bleDevice.gatt.connect();
 
-    const services = await withConnectTimeout(gattServer.getPrimaryServices(), "获取服务");
+    const services = await gattServer.getPrimaryServices();
     let targetService = null;
     for (const s of services) {
       const uuid = (s.uuid || "").toLowerCase();
@@ -297,7 +263,7 @@ async function connectToDevice(device) {
     }
     if (!targetService) throw new Error("未找到 FFF0 service");
 
-    const chars = await withConnectTimeout(targetService.getCharacteristics(), "获取特征值");
+    const chars = await targetService.getCharacteristics();
     notifyChar = null;
     writeChar = null;
     for (const ch of chars) {
@@ -311,7 +277,7 @@ async function connectToDevice(device) {
     protocolWarning = "";
     imuVitals.startSession();
     notifyChar.addEventListener("characteristicvaluechanged", handleNotify);
-    await withConnectTimeout(notifyChar.startNotifications(), "订阅通知");
+    await notifyChar.startNotifications();
 
     dom.deviceName.textContent = bleDevice.name || "Unknown";
     dom.deviceId.textContent = bleDevice.id || "(opaque id)";
@@ -326,12 +292,6 @@ async function connectToDevice(device) {
     notifyChar = null;
     writeChar = null;
     gattServer = null;
-    // 半开的 GATT 会让下一次 connect() 继续卡住，所以尽力断开。
-    try {
-      if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
-    } catch (cleanupErr) {
-      console.warn("清理半开蓝牙连接失败", cleanupErr);
-    }
     throw err;
   } finally {
     connectionAttemptInProgress = false;
