@@ -72,6 +72,11 @@ function feedFrames(h, count, { startSequence = 0, startMs = 100000 } = {}) {
   }
 }
 
+// Lets an async chain advance until it parks on a never-settling promise.
+function flushMicrotasks() {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
 // BLE side of the page, with setTimeout accounting so tests can inspect pending timers.
 function bleEnvironment(h) {
   const scheduled = new Map();
@@ -413,6 +418,63 @@ test('a chunk below the jitter threshold is dropped without consuming a part num
   assert.equal(h.downloads.length, 0, 'a 5-row fragment must not become a file');
   assert.equal(h.run('recordChunkIndex'), 1, 'a dropped fragment must not consume part 001');
   assert.equal(h.run('recordRunActive'), true, 'dropping a fragment must not end the run');
+});
+
+// Reproduces the field report "stuck at 正在连接 CityU_..., only a refresh recovers".
+// The four BLE handshake awaits have no upper bound; the diagnostic run proved that one
+// never-settling await leaves connectionAttemptInProgress true forever, which starves both
+// the manual button (app.js connectBle) and automatic reconnect (app.js autoSearchCityUDevices).
+test('a hanging gatt.connect() times out and releases the page for retries', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  // Device is in range but the handshake never settles: neither resolve nor reject.
+  ble.gatt.connect = () => new Promise(() => {});
+
+  h.run('connectBle()'); // deliberately not awaited — it never settles
+  await flushMicrotasks();
+  assert.equal(h.run('connectionAttemptInProgress'), true, 'the attempt is in flight');
+
+  const timeoutMs = h.run('CONNECT_TIMEOUT_MS');
+  const timer = [...ble.scheduled.values()].find(entry => entry.delay === timeoutMs);
+  assert.ok(timer, 'a connection timeout must be armed while the handshake is outstanding');
+
+  timer.callback();
+  await flushMicrotasks();
+
+  assert.equal(h.run('connectionAttemptInProgress'), false, 'the timeout must release the guard');
+  assert.equal(h.elements.get('btState').textContent, '等待 CityU 设备', 'the stuck state must move on');
+
+  // With the guard released, a retry has to actually dial again.
+  ble.gatt.connect = async function () { this.connected = true; return this; };
+  await h.run('autoSearchCityUDevices()');
+  assert.equal(h.run('connectionAttemptInProgress'), false);
+  assert.equal(h.elements.get('btState').textContent, '已连接', 'the retry must be able to succeed');
+});
+
+test('a handshake that resolves after the timeout is cleaned up instead of dangling', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  let resolveConnect;
+  const lateServer = { connected: true, disconnected: false, disconnect() { this.disconnected = true; } };
+  ble.gatt.connect = () => new Promise(resolve => { resolveConnect = resolve; });
+
+  h.run('connectBle()');
+  await flushMicrotasks();
+
+  const timeoutMs = h.run('CONNECT_TIMEOUT_MS');
+  [...ble.scheduled.values()].find(entry => entry.delay === timeoutMs).callback();
+  await flushMicrotasks();
+  assert.equal(h.run('connectionAttemptInProgress'), false);
+
+  // The dial finally comes back, long after we gave up on it.
+  resolveConnect(lateServer);
+  await flushMicrotasks();
+
+  assert.equal(lateServer.disconnected, true, 'a late success must not leave a dangling GATT link');
 });
 
 test('bundled browser worker matches source estimator without quality gating', () => {
