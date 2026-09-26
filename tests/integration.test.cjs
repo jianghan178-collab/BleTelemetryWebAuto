@@ -8,7 +8,9 @@ const root = path.join(__dirname, '..');
 
 function harness() {
   const elements = new Map();
+  const downloads = [];
   const document = {
+    body: { appendChild() {} },
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, {
         textContent: '', dataset: {}, style: {}, value: '20', innerHTML: '',
@@ -16,7 +18,13 @@ function harness() {
       });
       return elements.get(id);
     },
-    createElement() { return { className: '', textContent: '' }; }
+    createElement() {
+      return {
+        className: '', textContent: '', style: {}, href: '', download: '',
+        click() { downloads.push(this.download); },
+        remove() {}
+      };
+    }
   };
   class Chart { constructor(_, config) { this.data = config.data; } update() {} }
   class Worker {
@@ -30,14 +38,92 @@ function harness() {
     document, Chart, Worker, Date: class extends Date { static now() { return clock; } },
     navigator: {}, console: { log() {}, warn() {}, error() {} },
     Uint8Array, DataView, TextEncoder, setTimeout() {}, clearTimeout() {},
-    setInterval() {}, addEventListener() {}, alert() {}
+    setInterval() {}, addEventListener() {}, alert() {},
+    Blob: class { constructor(parts) { this.parts = parts; } },
+    URL: { createObjectURL: () => 'blob:test', revokeObjectURL() {} }
   });
   context.window = context;
   vm.runInContext(fs.readFileSync(path.join(root, 'imu-vitals.js'), 'utf8'), context);
   return {
-    context, elements, run: code => vm.runInContext(code, context),
+    context, elements, downloads, run: code => vm.runInContext(code, context),
     advance: ms => { clock += ms; },
     controller: () => new context.ImuVitals()
+  };
+}
+
+// A parsed v2 frame, shaped exactly like parseTelemetryFrame() output.
+function telemetryFrame(overrides = {}) {
+  return {
+    receivedAtMs: 100000, rawFrame: new Uint8Array(42), sequence: 1, mac: 'AABBCCDDEEFF',
+    tmp: 25, ax: 0.04, ay: 0.03, az: 9.81, gx: 0.01, gy: 0.02, gz: 0,
+    roll: 1, pitch: 2, yaw: 3, v1: 3.7, status: 0,
+    magActive: false, magRejected: false, sixAxis: false, ready: true,
+    magStale: false, imuStale: false, calibrated: false,
+    battery: 100, ms: 0, ...overrides
+  };
+}
+
+// Drives real frames through the recording path. rawFrame is dropped because it does not survive
+// serialization into the vm and the recording path never reads it.
+function feedFrames(h, count, { startSequence = 0, startMs = 100000 } = {}) {
+  for (let i = 0; i < count; i++) {
+    const { rawFrame, ...tele } = telemetryFrame({ sequence: startSequence + i, ms: startMs + i * 20 });
+    h.run(`acceptTelemetryFrame(${JSON.stringify(tele)})`);
+  }
+}
+
+// BLE side of the page, with setTimeout accounting so tests can inspect pending timers.
+function bleEnvironment(h) {
+  const scheduled = new Map();
+  const listeners = new Map();
+  let nextTimerId = 1;
+  h.context.setTimeout = h.context.window.setTimeout = (callback, delay) => {
+    const id = nextTimerId++;
+    scheduled.set(id, { callback, delay });
+    return id;
+  };
+  h.context.clearTimeout = h.context.window.clearTimeout = id => scheduled.delete(id);
+
+  const notify = {
+    uuid: '0000fff1-0000-1000-8000-00805f9b34fb',
+    addEventListener() {},
+    async startNotifications() {}
+  };
+  const write = { uuid: '0000fff2-0000-1000-8000-00805f9b34fb' };
+  const service = {
+    uuid: '0000fff0-0000-1000-8000-00805f9b34fb',
+    async getCharacteristics() { return [notify, write]; }
+  };
+  let connectCount = 0;
+  const device = {
+    name: 'CityU-C1-01', id: 'cityu-01',
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
+    }
+  };
+  const gatt = {
+    connected: false,
+    async connect() { this.connected = true; connectCount++; return this; },
+    async getPrimaryServices() { return [service]; },
+    disconnect() { this.connected = false; drop(); }
+  };
+  device.gatt = gatt;
+  function drop() {
+    const listener = listeners.get('gattserverdisconnected');
+    if (listener) listener({ target: device });
+  }
+  let requestOptions;
+  h.context.navigator.bluetooth = {
+    async requestDevice(options) { requestOptions = options; return device; },
+    async getDevices() { return [device]; }
+  };
+
+  return {
+    scheduled, listeners, device, gatt, drop,
+    connectCount: () => connectCount,
+    requestOptions: () => requestOptions,
+    searchTimers: () => [...scheduled.values()].filter(timer => timer.delay === 3000)
   };
 }
 function sample(index, period = 20, overrides = {}) {
@@ -184,6 +270,8 @@ test('CityU devices are filtered, retained-device reconnect works without getDev
     return id;
   };
   h.context.clearTimeout = h.context.window.clearTimeout = id => scheduled.delete(id);
+  // Recording timers share this stub, so assert on the 3s reconnect timer specifically.
+  const searchTimers = () => [...scheduled.values()].filter(timer => timer.delay === 3000);
   h.run('stopAutoSearch()');
 
   const listeners = new Map();
@@ -226,20 +314,105 @@ test('CityU devices are filtered, retained-device reconnect works without getDev
   assert.equal(requestOptions.filters[0].namePrefix, 'CityU');
   assert.equal(connectCount, 1);
   assert.equal(h.elements.get('btState').textContent, '已连接');
-  assert.equal(scheduled.size, 0, 'search timer must stop after connection');
+  assert.equal(searchTimers().length, 0, 'search timer must stop after connection');
 
   gatt.connected = false;
   listeners.get('gattserverdisconnected')({ target: device });
-  assert.equal([...scheduled.values()][0].delay, 3000);
+  assert.equal(searchTimers().length, 1);
+  assert.equal(searchTimers()[0].delay, 3000);
   delete h.context.navigator.bluetooth.getDevices;
   await h.run('autoSearchCityUDevices()');
   assert.equal(connectCount, 2);
   assert.equal(h.elements.get('deviceName').textContent, 'CityU-C1-01');
-  assert.equal(scheduled.size, 0, 'reconnect must cancel the pending search');
+  assert.equal(searchTimers().length, 0, 'reconnect must cancel the pending search');
 
   await h.run('disconnectBle()');
   assert.equal(h.run('autoConnectEnabled'), false);
-  assert.equal(scheduled.size, 0, 'manual disconnect must pause automatic reconnect');
+  assert.equal(searchTimers().length, 0, 'manual disconnect must pause automatic reconnect');
+});
+
+test('connecting starts recording without a click', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  bleEnvironment(h);
+
+  await h.run('connectBle()');
+
+  assert.equal(h.run('isRecording'), true);
+  assert.equal(h.run('recordRunActive'), true);
+  assert.equal(h.elements.get('btnRecord').textContent, '停止记录（每5分钟自动保存）');
+});
+
+test('a dropped link keeps the recording intent and saves the partial chunk', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  await h.run('connectBle()');
+  feedFrames(h, 40);
+  assert.equal(h.run('recordBuffer.length'), 40);
+
+  ble.drop();
+
+  assert.equal(h.run('isRecording'), false, 'link loss ends the current chunk');
+  assert.equal(h.run('recordRunActive'), true, 'but the intent to record survives');
+  assert.equal(h.run('recordChunkIndex'), 2, 'the saved chunk consumed part 001');
+  assert.equal(h.downloads.length, 1);
+  assert.match(h.downloads[0], /part001\.csv$/);
+});
+
+test('reconnecting resumes recording and continues the part numbering', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  await h.run('connectBle()');
+  feedFrames(h, 40);
+  ble.drop();
+  assert.equal(h.downloads.length, 1);
+
+  await h.run('autoSearchCityUDevices()');
+
+  assert.equal(h.run('isRecording'), true, 'reconnect must resume recording without a click');
+  assert.equal(h.run('recordChunkIndex'), 2, 'numbering must continue, not restart at part 1');
+
+  feedFrames(h, 40, { startSequence: 40, startMs: 100800 });
+  ble.drop();
+  assert.equal(h.downloads.length, 2);
+  assert.match(h.downloads[1], /part002\.csv$/, 'the resumed chunk must be part 002');
+});
+
+test('a manual stop ends the run so the next connection starts a fresh part 1', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  await h.run('connectBle()');
+  feedFrames(h, 40);
+  h.run('toggleRecord()');
+
+  assert.equal(h.run('isRecording'), false);
+  assert.equal(h.run('recordRunActive'), false, 'a manual stop is an explicit end of the run');
+
+  ble.drop();
+  await h.run('autoSearchCityUDevices()');
+
+  assert.equal(h.run('isRecording'), true, 'a new connection still auto-starts recording');
+  assert.equal(h.run('recordChunkIndex'), 1, 'a fresh run restarts numbering at part 1');
+});
+
+test('a chunk below the jitter threshold is dropped without consuming a part number', async () => {
+  const h = harness();
+  h.run(fs.readFileSync(path.join(root, 'app.js'), 'utf8'));
+  const ble = bleEnvironment(h);
+
+  await h.run('connectBle()');
+  feedFrames(h, 5);
+  ble.drop();
+
+  assert.equal(h.downloads.length, 0, 'a 5-row fragment must not become a file');
+  assert.equal(h.run('recordChunkIndex'), 1, 'a dropped fragment must not consume part 001');
+  assert.equal(h.run('recordRunActive'), true, 'dropping a fragment must not end the run');
 });
 
 test('bundled browser worker matches source estimator without quality gating', () => {

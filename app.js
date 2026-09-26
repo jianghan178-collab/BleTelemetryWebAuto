@@ -14,6 +14,8 @@ const DISPLAY_INTERVAL_MS = 50; // 20 FPS
 const AIRCRAFT_RENDER_INTERVAL_MS = 50; // 20 FPS
 const MAX_RENDER_PIXEL_RATIO = 1.25;
 const RECORD_CHUNK_INTERVAL_MS = 5 * 60 * 1000;
+// 抖动保护：低于此行的分片不落盘（信号反复瞬断时避免产生大量碎文件）。
+const RECORD_MIN_CHUNK_ROWS = 10;
 const BEIJING_UTC_OFFSET_MS = 8 * 60 * 60 * 1000;
 const RECORD_CSV_HEADER = [
   "timestamp_beijing_utc_plus_8",
@@ -47,6 +49,8 @@ let lastDisplayedTele = null;
 const imuVitals = new window.ImuVitals();
 
 let isRecording = false;
+// 「要记录」的意图。掉线时保留，重连后据此续接；手动停止才清除。
+let recordRunActive = false;
 let recordBuffer = [];
 let recordChunkStartedAtMs = 0;
 let recordChunkDeadlineMs = 0;
@@ -281,6 +285,9 @@ async function connectToDevice(device) {
     dom.sessionTime.textContent = fmtNow();
     setState("ok", "已连接");
     stopAutoSearch();
+    // 连上即开始采集：已有记录意图就续接，否则开一段新会话。
+    if (recordRunActive) resumeRecording();
+    else beginRecordingRun();
   } catch (err) {
     notifyChar = null;
     writeChar = null;
@@ -312,30 +319,69 @@ function onDisconnected(event) {
   dom.lastReceive.textContent = "-";
   renderFrames();
   clearWaveCharts();
-  if (isRecording) stopRecord();
+  suspendRecording();
   scheduleAutoSearch();
 }
 
 function toggleRecord() {
-  if (!isRecording) {
-    startRecord();
-  } else {
+  if (isRecording || recordRunActive) {
     stopRecord();
+  } else {
+    beginRecordingRun();
   }
 }
 
-function startRecord() {
+// 开新的一段记录会话：分片编号从 001 重新开始。
+function beginRecordingRun() {
+  recordRunActive = true;
+  recordChunkIndex = 1;
+  resumeRecording();
+}
+
+// 续接当前会话（首次连接和掉线重连都走这里），分片编号保持连续。
+function resumeRecording() {
+  if (isRecording || !recordRunActive) return;
+
   const now = Date.now();
   isRecording = true;
   recordBuffer = [];
   recordChunkStartedAtMs = now;
   recordChunkDeadlineMs = now + RECORD_CHUNK_INTERVAL_MS;
-  recordChunkIndex = 1;
   scheduleRecordFlush();
+  renderRecordButton();
+}
 
-  dom.btnRecord.textContent = "停止记录（每5分钟自动保存）";
-  dom.btnRecord.style.background = "rgba(255,123,136,.25)";
-  dom.btnRecord.style.border = "1px solid rgba(255,123,136,.4)";
+// 掉线：落盘当前分片保住数据，但保留记录意图和分片编号，等待重连续接。
+function suspendRecording() {
+  if (!isRecording) return;
+
+  const suspendedAtMs = Date.now();
+  isRecording = false;
+  clearRecordFlushTimer();
+  flushRecordChunk(suspendedAtMs);
+  recordChunkStartedAtMs = 0;
+  recordChunkDeadlineMs = 0;
+  renderRecordButton();
+}
+
+function renderRecordButton() {
+  if (isRecording) {
+    dom.btnRecord.textContent = "停止记录（每5分钟自动保存）";
+  } else if (recordRunActive) {
+    dom.btnRecord.textContent = "停止记录";
+  } else {
+    dom.btnRecord.textContent = "开始记录";
+  }
+  const active = isRecording || recordRunActive;
+  dom.btnRecord.style.background = active ? "rgba(255,123,136,.25)" : "";
+  dom.btnRecord.style.border = active ? "1px solid rgba(255,123,136,.4)" : "";
+}
+
+function clearRecordFlushTimer() {
+  if (recordFlushTimerId !== null) {
+    clearTimeout(recordFlushTimerId);
+    recordFlushTimerId = null;
+  }
 }
 
 function scheduleRecordFlush() {
@@ -367,6 +413,8 @@ function flushRecordChunk(chunkEndedAtMs) {
   const rows = recordBuffer;
   recordBuffer = [];
   if (!rows.length) return;
+  // 抖动保护放在编号自增之前：被丢弃的碎分片不占用 part 编号。
+  if (rows.length < RECORD_MIN_CHUNK_ROWS) return;
 
   const chunkStartedAtMs = recordChunkStartedAtMs;
   const part = padNumber(recordChunkIndex, 3);
@@ -393,21 +441,19 @@ function flushRecordChunk(chunkEndedAtMs) {
 }
 
 function stopRecord() {
-  if (!isRecording) return;
+  recordRunActive = false;
+  if (!isRecording) {
+    renderRecordButton();
+    return;
+  }
 
   const stoppedAtMs = Date.now();
   isRecording = false;
-  if (recordFlushTimerId !== null) {
-    clearTimeout(recordFlushTimerId);
-    recordFlushTimerId = null;
-  }
+  clearRecordFlushTimer();
   flushRecordChunk(stoppedAtMs);
   recordChunkStartedAtMs = 0;
   recordChunkDeadlineMs = 0;
-
-  dom.btnRecord.textContent = "开始记录";
-  dom.btnRecord.style.background = "";
-  dom.btnRecord.style.border = "";
+  renderRecordButton();
 }
 
 async function disconnectBle() {
